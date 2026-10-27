@@ -136,11 +136,17 @@ export const GpsPanel: React.FC<GpsPanelProps> = ({ gps, trailPoints = [] }) => 
             <Satellite className="w-3.5 h-3.5 text-emerald-400" />
           </div>
           <div className="mt-1.5 text-base md:text-lg font-bold font-mono text-emerald-400 flex items-baseline gap-1">
-            <span>{sats}</span>
+            <span>{gps?.satellites != null ? sats : "—"}</span>
             <span className="text-xs font-normal text-slate-400">tracked</span>
           </div>
           <div className="text-[11px] text-slate-500 font-mono mt-0.5">
-            {sats >= 4 ? "3D Trilateration OK" : sats > 0 ? "Insufficient (needs 4+)" : "No satellites"}
+            {gps?.satellites == null
+              ? "Receiver unattached"
+              : sats >= 4
+              ? "3D Trilateration OK"
+              : sats > 0
+              ? "Insufficient (needs 4+)"
+              : "No satellites"}
           </div>
         </div>
       </div>

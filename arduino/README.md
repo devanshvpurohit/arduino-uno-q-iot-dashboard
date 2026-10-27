@@ -1,14 +1,77 @@
-# Arduino UNO Q — Firmware & Hardware Integration Guide
+# Arduino UNO Q — Firmware & Python Bridge Integration Guide
 
-This directory contains the production-grade Arduino firmware (`arduino_uno_q_telemetry.ino`) for streaming real-time GPS, 6-DoF IMU, and OLED telemetry to the Next.js IoT Dashboard.
+This directory contains the production-grade integration for streaming real-time GPS, 6-DoF IMU, and OLED telemetry from the **Arduino UNO Q** to the Next.js / Vercel cloud dashboard.
 
 ---
 
-## 1. Hardware Pinout & Wiring Diagram
+## 1. Dual-Core Architecture Overview
 
-The Arduino UNO Q uses standard hardware I2C (`Wire`) and hardware UART (`Serial1` on pins D0/D1). Both the **MPU6050** and **SSD1306 OLED** share the primary hardware I2C bus at different 7-bit addresses (`0x68` and `0x3C` respectively).
+The Arduino UNO Q features a hybrid architecture combining a high-speed real-time microcontroller (MCU) with an onboard Linux MPU environment.
 
-### Complete Wiring Table
+```
+┌───────────────────────────────────────────────┐
+│              Arduino UNO Q Hardware           │
+│                                               │
+│  ┌────────────────────────┐                   │
+│  │  Sensors & Display     │                   │
+│  │  - NEO-6M GPS (UART)   │                   │
+│  │  - MPU6050 IMU (I2C)   │                   │
+│  │  - SSD1306 OLED (I2C)  │                   │
+│  └───────────┬────────────┘                   │
+│              │ Real-time sampling             │
+│              ▼                                │
+│  ┌────────────────────────┐                   │
+│  │  Microcontroller Core  │                   │
+│  │  (C++ Sketch)          │                   │
+│  └───────────┬────────────┘                   │
+│              │ Bridge.notify("receiveTelemetry")
+│              ▼                                │
+│  ┌────────────────────────┐                   │
+│  │  Onboard Linux MPU     │                   │
+│  │  (Python Bridge)       │                   │
+│  │  uno_q_bridge.py       │                   │
+│  └───────────┬────────────┘                   │
+└──────────────┼────────────────────────────────┘
+               │ HTTPS POST (requests.Session)
+               │ Bearer UNOQ-IoT-2026-Devansh-9f7c2a8e4b6d
+               ▼
+┌───────────────────────────────────────────────┐
+│   https://arduino-uno-q-iot-dashboard.vercel.app  │
+│   (Server-Sent Events -> Real-Time Dashboard) │
+└───────────────────────────────────────────────┘
+```
+
+---
+
+## 2. Option 1: Arduino App Lab (Recommended for UNO Q)
+
+In Arduino App Lab, the Python bridge runs on the Linux core, receiving data from the sketch and uploading it via HTTPS.
+
+### Step 1: Upload the C++ Sketch
+Open `arduino/arduino_uno_q_telemetry/arduino_uno_q_telemetry.ino` in the Arduino IDE and upload it to the **Arduino UNO Q**.
+Leave `#define USE_UNO_Q_BRIDGE 1` enabled.
+
+### Step 2: Run the Python Bridge
+In the Arduino App Lab Linux terminal (or via App Lab runner):
+```bash
+python3 uno_q_bridge.py
+```
+
+#### What `uno_q_bridge.py` does:
+1. Listens for `Bridge.notify("receiveTelemetry", ...)` events from the sketch.
+2. Accepts both nested (`{"imu": {...}, "gps": {...}}`) and flat sensor keys.
+3. Automatically attaches ISO 8601 UTC timestamps.
+4. Handles GPS placeholders (`satellites: null`, `fix: false`) until a satellite lock is acquired.
+5. Reuses TCP connections via `requests.Session()` with 15-second timeouts.
+6. Authenticates with:
+   ```python
+   API_KEY = "UNOQ-IoT-2026-Devansh-9f7c2a8e4b6d"
+   URL = "https://arduino-uno-q-iot-dashboard.vercel.app/api/telemetry"
+   ```
+
+---
+
+## 3. Hardware Pinout & Wiring Table
 
 | Peripheral | Peripheral Pin | Arduino UNO Q Pin | Notes |
 | :--- | :--- | :--- | :--- |
@@ -19,88 +82,25 @@ The Arduino UNO Q uses standard hardware I2C (`Wire`) and hardware UART (`Serial
 | | AD0 | GND | Sets I2C address to `0x68` |
 | **SSD1306 OLED** | VCC | 3.3V or 5V | 128x64 I2C display |
 | | GND | GND | Ground |
-| | SDA | **SDA** | Shared hardware I2C data bus |
+| | SDA | **SDA** | Shared hardware I2C data bus (0x3C) |
 | | SCL | **SCL** | Shared hardware I2C clock bus |
 | **NEO-6M GPS** | VCC | 5V | Requires active 5V for antenna LNA |
 | | GND | GND | Common ground |
 | | TX | **Pin 0 (RX / Serial1)** | GPS output to Arduino input |
-| | RX | **Pin 1 (TX / Serial1)** | Optional (for configuration commands) |
-
-> **Important Architecture Rule:**
-> Do NOT use `SoftwareSerial` or custom bit-banged I2C implementations. The Arduino UNO Q / Zephyr core provides hardware `Serial1` and verified hardware `Wire` drivers operating at 400 kHz.
+| | RX | **Pin 1 (TX / Serial1)** | Optional |
 
 ---
 
-## 2. Required Arduino Libraries
+## 4. Option 2: Standalone Wi-Fi Mode (Without App Lab)
 
-Install these libraries via the **Arduino IDE Library Manager** (`Ctrl+Shift+I` or `Cmd+Shift+I`):
-
-1. **TinyGPSPlus** by Mikal Hart (v1.0.3+)
-2. **Adafruit SSD1306** by Adafruit (v2.5.7+)
-3. **Adafruit GFX Library** by Adafruit (v1.11.5+)
-4. **WiFiS3** / **WiFiClientSecure** (Bundled with the Arduino core)
-
----
-
-## 3. Firmware Configuration
-
-Open `arduino_uno_q_telemetry.ino` and configure the top variables:
-
-```cpp
-// 1. Wi-Fi Credentials
-const char* WIFI_SSID       = "Your_WiFi_Network";
-const char* WIFI_PASSWORD   = "Your_WiFi_Password";
-
-// 2. Server Address
-// Local testing: "192.168.1.50" with port 3000
-// Vercel deployment: "your-dashboard.vercel.app" with port 443
-const char* SERVER_HOST     = "your-iot-dashboard.vercel.app";
-const int   SERVER_PORT     = 443;
-const char* TELEMETRY_PATH  = "/api/telemetry";
-
-// 3. Security Key
-// Must match the DEVICE_API_KEY environment variable on the server
-const char* DEVICE_API_KEY  = "arduino-uno-q-secret-key-2026";
-```
-
----
-
-## 4. Key Architectural Design Patterns
-
-### A. Non-Blocking GPS Ingestion
-GPS NMEA sentences arrive at 9600 baud continuously. If the microcontroller blocks during Wi-Fi transmissions or delays, the 64-byte hardware UART FIFO overflows, causing checksum errors and dropped fixes.
-The sketch calls `feedGpsSerial()` on every iteration of `loop()`, and during network waits, guaranteeing zero lost characters.
-
-### B. Decoupled Sensor Acquisition
-Sensor registers and GPS coordinates are polled cleanly before network transmission. If network drops or Wi-Fi reconnects, sensor updates and the local SSD1306 OLED refresh continue running smoothly.
-
-### C. Exponential Backoff on Failure
-If the server returns a non-200 status or the Wi-Fi connection drops:
-1. The firmware prints the error code to Serial.
-2. The retry interval doubles: `1s -> 2s -> 4s -> 8s -> 16s` (capped at 16s).
-3. The OLED status shows `NET ERR - BACKOFF`.
-4. As soon as a transmission succeeds (`200 OK`), backoff instantly resets to 0 ms (1 Hz).
-
-### D. Zero-Persistence Policy
-No readings are written to local EEPROM or SD card. The device strictly maintains the current state in volatile microcontroller SRAM.
-
----
-
-## 5. Serial Monitor Output Sample
-
-Open Serial Monitor at **115200 baud**:
-
-```text
-==================================================
-     Arduino UNO Q Real-Time IoT Telemetry Node    
-==================================================
-[OK] SSD1306 OLED Initialized (128x64).
-[OK] MPU6050 initialized successfully at I2C 0x68.
-[OK] NEO-6M GPS UART Serial1 started at 9600 baud.
-[WIFI] Connecting to LabNetwork....
-[WIFI] Connected!
-[WIFI] IP Address: 192.168.29.187
-[OK] Sensor acquisition loop active. Uplink cadence: 1 Hz.
-[HTTPS POST] Status: 200 | Round-trip: 78 ms | Fix: YES | Sats: 9 | Accel Z: 1.002
-[HTTPS POST] Status: 200 | Round-trip: 64 ms | Fix: YES | Sats: 9 | Accel Z: 0.998
-```
+If running the Arduino sketch without the Linux bridge:
+1. In `arduino_uno_q_telemetry.ino`, set:
+   ```cpp
+   #define USE_UNO_Q_BRIDGE 0
+   ```
+2. Set your Wi-Fi credentials:
+   ```cpp
+   const char* WIFI_SSID     = "Your_SSID";
+   const char* WIFI_PASSWORD = "Your_Password";
+   ```
+3. Upload to the board. The sketch connects directly to Wi-Fi and performs direct HTTPS POST requests.

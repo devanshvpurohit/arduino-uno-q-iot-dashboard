@@ -31,11 +31,11 @@ export const Navbar: React.FC<NavbarProps> = ({
   const [showCurlModal, setShowCurlModal] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  const curlExample = `curl -X POST https://your-domain.vercel.app/api/telemetry \\
+  const curlExample = `curl -X POST https://arduino-uno-q-iot-dashboard.vercel.app/api/telemetry \\
   -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer arduino-uno-q-secret-key-2026" \\
+  -H "Authorization: Bearer UNOQ-IoT-2026-Devansh-9f7c2a8e4b6d" \\
   -d '{
-    "device_id": "uno-q-01",
+    "device_id": "arduino-uno-q",
     "timestamp": "2026-10-27T15:00:00.000Z",
     "gps": {
       "latitude": 17.3850,
@@ -179,8 +179,8 @@ export const Navbar: React.FC<NavbarProps> = ({
                   <span className="text-cyan-300">Authorization: Bearer &lt;DEVICE_API_KEY&gt;</span>
                 </div>
                 <div>
-                  <span className="text-slate-500">Default Key:</span>{" "}
-                  <span className="text-amber-300">arduino-uno-q-secret-key-2026</span>
+                  <span className="text-slate-500">Device API Key:</span>{" "}
+                  <span className="text-amber-300 font-mono">UNOQ-IoT-2026-Devansh-9f7c2a8e4b6d</span>
                 </div>
                 <div>
                   <span className="text-slate-500">Content-Type:</span>{" "}

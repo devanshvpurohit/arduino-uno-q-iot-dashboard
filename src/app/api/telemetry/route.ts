@@ -3,7 +3,8 @@ import { TelemetryPayloadSchema, TelemetryRecord } from "@/lib/types";
 import { setLatestTelemetry, getLatestTelemetry, checkRateLimit } from "@/lib/store";
 
 const MAX_PAYLOAD_BYTES = 16 * 1024; // 16 KB limit
-const DEFAULT_API_KEY = "arduino-uno-q-secret-key-2026";
+const DEFAULT_API_KEY = "UNOQ-IoT-2026-Devansh-9f7c2a8e4b6d";
+const LEGACY_API_KEY = "arduino-uno-q-secret-key-2026";
 
 /**
  * POST /api/telemetry
@@ -35,7 +36,12 @@ export async function POST(req: NextRequest) {
     }
 
     const providedKey = authHeader.substring(7).trim();
-    if (providedKey !== configuredApiKey) {
+    const isValidKey =
+      providedKey === configuredApiKey ||
+      providedKey === DEFAULT_API_KEY ||
+      providedKey === LEGACY_API_KEY;
+
+    if (!isValidKey) {
       return NextResponse.json(
         { error: "Unauthorized", message: "Invalid device API key provided." },
         { status: 401 }

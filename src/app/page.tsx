@@ -219,7 +219,7 @@ export default function DashboardPage() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: "Bearer arduino-uno-q-secret-key-2026",
+          Authorization: "Bearer UNOQ-IoT-2026-Devansh-9f7c2a8e4b6d",
         },
         body: JSON.stringify(testData),
       });

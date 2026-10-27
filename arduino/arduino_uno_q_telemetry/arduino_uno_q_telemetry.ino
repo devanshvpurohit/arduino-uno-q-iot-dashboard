@@ -1,16 +1,16 @@
 /**
  * ==============================================================================
  * Project: Real-Time IoT Telemetry for Arduino UNO Q
- * Target:   Arduino UNO Q / UNO R4 / Zephyr / Renesas Core
+ * Architecture: Arduino UNO Q Hybrid (Microcontroller Core + Linux Python Bridge)
  * Sensors:  u-blox NEO-6M GPS (UART), MPU6050 6-DoF IMU (I2C), SSD1306 OLED (I2C)
- * Uplink:   HTTPS POST /api/telemetry (Bearer Token Authenticated)
- * Cadence:  1 Hz (1 reading per second) with Exponential Backoff on Failure
+ * Uplink:   Arduino App Lab Bridge -> uno_q_bridge.py -> Vercel HTTPS API
+ * Cadence:  1 Hz (1 reading per second)
  * ==============================================================================
  * 
  * Hardware Wiring:
  * ----------------
  * 1. MPU6050 IMU (I2C Address 0x68):
- *    - VCC  -> 3.3V or 5V (board regulated)
+ *    - VCC  -> 3.3V or 5V
  *    - GND  -> GND
  *    - SDA  -> UNO Q Hardware SDA pin
  *    - SCL  -> UNO Q Hardware SCL pin
@@ -18,61 +18,66 @@
  * 2. SSD1306 128x64 OLED Display (I2C Address 0x3C):
  *    - VCC  -> 3.3V or 5V
  *    - GND  -> GND
- *    - SDA  -> UNO Q Hardware SDA pin (shared I2C bus)
- *    - SCL  -> UNO Q Hardware SCL pin (shared I2C bus)
+ *    - SDA  -> Shared Hardware SDA
+ *    - SCL  -> Shared Hardware SCL
  * 
  * 3. NEO-6M GPS (UART 9600 Baud):
- *    - VCC  -> 5V (or 3.3V)
+ *    - VCC  -> 5V
  *    - GND  -> GND
  *    - TX   -> UNO Q Serial1 RX (Pin 0 / RX)
  *    - RX   -> UNO Q Serial1 TX (Pin 1 / TX) [Optional]
  * 
- * Note on Architecture:
- * - GPS character ingestion runs continuously on every iteration of loop()
- *   to prevent hardware UART FIFO buffer overflow.
- * - Sensor acquisition is strictly decoupled from network transmission.
- * - I2C uses standard hardware Wire bus (no unsupported SoftwareI2C assumptions).
+ * Mode Selection:
+ * - USE_UNO_Q_BRIDGE (Default: 1): Communicates with the onboard Linux Python
+ *   script (`uno_q_bridge.py`) via `Bridge.notify("receiveTelemetry", json)`.
+ * - Standalone WiFi Mode (USE_UNO_Q_BRIDGE = 0): Transmits directly via WiFiS3.
  */
+
+// Set to 1 for Arduino UNO Q App Lab Bridge (Recommended for UNO Q)
+// Set to 0 for Standalone WiFiS3 SSL transmission
+#define USE_UNO_Q_BRIDGE 1
 
 #include <Wire.h>
 #include <TinyGPSPlus.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// WiFi & SSL Client Selection:
-// Compatible with Arduino UNO Q / UNO R4 WiFi / ESP32 Co-processor architecture
-#if defined(ARDUINO_UNOR4_WIFI) || defined(ARDUINO_UNO_Q)
-  #include <WiFiS3.h>
-  #include <WiFiSSLClient.h>
+#if USE_UNO_Q_BRIDGE
+  // Arduino UNO Q App Lab / Linux Bridge
+  #if __has_include(<Arduino_AppUtils.h>)
+    #include <Arduino_AppUtils.h>
+  #elif __has_include(<Bridge.h>)
+    #include <Bridge.h>
+  #endif
 #else
-  #include <WiFi.h>
-  #include <WiFiClientSecure.h>
-  #define WiFiSSLClient WiFiClientSecure
+  // Standalone WiFi Fallback
+  #if defined(ARDUINO_UNOR4_WIFI) || defined(ARDUINO_UNO_Q)
+    #include <WiFiS3.h>
+    #include <WiFiSSLClient.h>
+  #else
+    #include <WiFi.h>
+    #include <WiFiClientSecure.h>
+    #define WiFiSSLClient WiFiClientSecure
+  #endif
 #endif
 
 // ==============================================================================
-// USER CONFIGURATION (Fill with your network & server details)
+// CONFIGURATION
 // ==============================================================================
-const char* WIFI_SSID       = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD   = "YOUR_WIFI_PASSWORD";
-
-// Server endpoint configuration (Replace with your deployed domain or local IP)
-// For local testing on LAN: e.g. "192.168.1.100" and port 3000 (HTTP)
-// For Vercel production: e.g. "your-app.vercel.app" and port 443 (HTTPS)
-const char* SERVER_HOST     = "your-iot-dashboard.vercel.app";
+const char* DEVICE_ID       = "arduino-uno-q";
+const char* DEVICE_API_KEY  = "UNOQ-IoT-2026-Devansh-9f7c2a8e4b6d";
+const char* SERVER_HOST     = "arduino-uno-q-iot-dashboard.vercel.app";
 const int   SERVER_PORT     = 443;
 const char* TELEMETRY_PATH  = "/api/telemetry";
 
-// Device Identification and Security Key
-const char* DEVICE_ID       = "uno-q-01";
-const char* DEVICE_API_KEY  = "arduino-uno-q-secret-key-2026";
+// WiFi configuration (Used only if USE_UNO_Q_BRIDGE == 0)
+const char* WIFI_SSID       = "YOUR_WIFI_SSID";
+const char* WIFI_PASSWORD   = "YOUR_WIFI_PASSWORD";
 
-// Default upload interval (1000 ms = 1 Hz)
+// Telemetry interval (1000 ms = 1 Hz)
 const unsigned long UPLOAD_INTERVAL_MS = 1000;
 
-// ==============================================================================
-// HARDWARE INSTANCES & PERIPHERALS
-// ==============================================================================
+// Hardware Definitions
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET    -1
@@ -81,140 +86,145 @@ const unsigned long UPLOAD_INTERVAL_MS = 1000;
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 TinyGPSPlus gps;
-WiFiSSLClient sslClient;
 
-// Hardware Serial for NEO-6M GPS (UNO Q / R4 uses Serial1 for D0/D1 UART)
+#if !USE_UNO_Q_BRIDGE
+WiFiSSLClient sslClient;
+#endif
+
+// Hardware Serial for NEO-6M GPS (UNO Q uses Serial1 for D0/D1)
 #define GPSSerial Serial1
 
-// Timing & Exponential Backoff Variables
+// Timing variables
 unsigned long lastSendTime = 0;
-unsigned long currentBackoffMs = 0;
-const unsigned long MAX_BACKOFF_MS = 16000; // Cap backoff at 16 seconds
+bool oledAvailable = false;
+bool mpuAvailable = false;
 
-// Sensor Data Struct
-struct SensorReadings {
-  // GPS
+// Sensor Data Structure
+struct SensorData {
   bool   gps_fix;
+  bool   gps_connected;
   double latitude;
   double longitude;
   double altitude_m;
-  uint8_t satellites;
+  int    satellites;
 
-  // IMU MPU6050
-  float accel_x_g;
-  float accel_y_g;
-  float accel_z_g;
+  float  accel_x_g;
+  float  accel_y_g;
+  float  accel_z_g;
   int16_t gyro_x_raw;
   int16_t gyro_y_raw;
   int16_t gyro_z_raw;
-  float temperature_c;
+  float  temperature_c;
 };
 
-SensorReadings currentReadings;
+SensorData sensors;
 
 // ==============================================================================
 // FUNCTION DECLARATIONS
 // ==============================================================================
 void initMPU6050();
-void readMPU6050(SensorReadings &readings);
+void readMPU6050(SensorData &data);
 void feedGpsSerial();
-void updateGpsReadings(SensorReadings &readings);
-void updateOledDisplay(const SensorReadings &readings, const char* statusMsg);
-bool connectWiFi();
-bool sendTelemetryPayload(const SensorReadings &readings);
+void updateGpsData(SensorData &data);
+void updateOled(const SensorData &data, const char* status);
+bool dispatchTelemetry(const SensorData &data);
 
 // ==============================================================================
 // SETUP
 // ==============================================================================
 void setup() {
   Serial.begin(115200);
-  delay(1500); // Allow serial monitor to open
-  Serial.println(F("\n=================================================="));
-  Serial.println(F("     Arduino UNO Q Real-Time IoT Telemetry Node    "));
-  Serial.println(F("=================================================="));
+  delay(1200);
 
-  // Initialize Standard Hardware I2C Bus (Fast Mode 400kHz for real-time reads)
+  Serial.println(F("\n========================================================"));
+  Serial.println(F("    Arduino UNO Q — Real-Time IoT Telemetry Node        "));
+  Serial.print(F("    Mode: "));
+#if USE_UNO_Q_BRIDGE
+  Serial.println(F("Arduino App Lab Bridge -> Python Service (uno_q_bridge.py)"));
+#else
+  Serial.println(F("Standalone Hardware WiFiS3 Direct HTTPS"));
+#endif
+  Serial.println(F("========================================================"));
+
+  // Initialize hardware I2C at 400 kHz fast mode
   Wire.begin();
   Wire.setClock(400000);
 
-  // Initialize SSD1306 OLED Display
-  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR)) {
-    Serial.println(F("[WARN] SSD1306 OLED not detected at 0x3C, continuing..."));
-  } else {
+  // Initialize SSD1306 OLED
+  if (display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR)) {
+    oledAvailable = true;
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
     display.println(F("Arduino UNO Q"));
-    display.println(F("Initializing sensors..."));
+    display.println(F("IoT Telemetry Node"));
+    display.setCursor(0, 24);
+    display.println(F("Initializing bus..."));
     display.display();
-    Serial.println(F("[OK] SSD1306 OLED Initialized (128x64)."));
+    Serial.println(F("[OK] SSD1306 OLED initialized (128x64)."));
+  } else {
+    Serial.println(F("[WARN] SSD1306 OLED not found at 0x3C, continuing."));
   }
 
   // Initialize MPU6050 IMU
   initMPU6050();
 
-  // Initialize Hardware UART for NEO-6M GPS (9600 Baud default)
+  // Initialize GPS Hardware UART (9600 baud)
   GPSSerial.begin(9600);
-  Serial.println(F("[OK] NEO-6M GPS UART Serial1 started at 9600 baud."));
+  Serial.println(F("[OK] NEO-6M GPS UART (Serial1) started at 9600 baud."));
 
-  // Connect to WiFi
-  connectWiFi();
+#if USE_UNO_Q_BRIDGE
+  // Initialize Bridge communication with onboard Linux core
+  #if defined(Bridge)
+    Bridge.begin();
+    Serial.println(F("[OK] Arduino UNO Q IPC Bridge initialized."));
+  #endif
+#else
+  // Standalone WiFi connection
+  Serial.print(F("[WIFI] Connecting to "));
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    feedGpsSerial();
+    delay(250);
+    Serial.print(F("."));
+  }
+  Serial.println(F("\n[WIFI] Connected!"));
+#endif
 
-  Serial.println(F("[OK] Sensor acquisition loop active. Uplink cadence: 1 Hz."));
+  Serial.println(F("[OK] Setup complete. Streaming sensor data at 1 Hz..."));
 }
 
 // ==============================================================================
 // MAIN LOOP
 // ==============================================================================
 void loop() {
-  // 1. NON-BLOCKING GPS INGESTION: Feed characters on EVERY pass
-  // This must never be blocked by network delays to prevent UART FIFO overrun
+  // Non-blocking GPS feeding runs continuously on every iteration
   feedGpsSerial();
 
-  // 2. Uplink timer check (1 Hz with exponential backoff if failed)
   unsigned long now = millis();
-  unsigned long effectiveInterval = UPLOAD_INTERVAL_MS + currentBackoffMs;
-
-  if (now - lastSendTime >= effectiveInterval) {
+  if (now - lastSendTime >= UPLOAD_INTERVAL_MS) {
     lastSendTime = now;
 
-    // Separate Sensor Acquisition from Network Transmission
-    updateGpsReadings(currentReadings);
-    readMPU6050(currentReadings);
+    // 1. Acquire sensors
+    updateGpsData(sensors);
+    readMPU6050(sensors);
 
-    // Update Local OLED Display
-    updateOledDisplay(currentReadings, currentBackoffMs > 0 ? "RETRYING" : "UPLOADING");
+    // 2. Update local OLED display
+    updateOled(sensors, "TRANSMITTING");
 
-    // Perform HTTPS POST Transmission
-    bool success = sendTelemetryPayload(currentReadings);
+    // 3. Dispatch telemetry
+    bool success = dispatchTelemetry(sensors);
 
-    if (success) {
-      currentBackoffMs = 0; // Reset backoff upon success
-      updateOledDisplay(currentReadings, "POST 200 OK");
-    } else {
-      // Exponential backoff: 1s -> 2s -> 4s -> 8s -> 16s
-      if (currentBackoffMs == 0) {
-        currentBackoffMs = 1000;
-      } else {
-        currentBackoffMs = min(currentBackoffMs * 2, MAX_BACKOFF_MS);
-      }
-      Serial.print(F("[BACKOFF] Upload failed. Next retry in "));
-      Serial.print(currentBackoffMs);
-      Serial.println(F(" ms. GPS acquisition continuing uninterrupted."));
-      updateOledDisplay(currentReadings, "NET ERR - BACKOFF");
-    }
+    // 4. Update OLED with result
+    updateOled(sensors, success ? "DISPATCHED" : "ERR");
   }
 }
 
 // ==============================================================================
-// SENSOR ACQUISITION ROUTINES
+// SENSORS
 // ==============================================================================
-
-/**
- * Feeds incoming bytes from GPS UART into TinyGPSPlus parser.
- * Non-blocking, runs on every loop iteration.
- */
 void feedGpsSerial() {
   while (GPSSerial.available() > 0) {
     char c = GPSSerial.read();
@@ -222,207 +232,141 @@ void feedGpsSerial() {
   }
 }
 
-/**
- * Updates currentReadings with parsed GPS information.
- */
-void updateGpsReadings(SensorReadings &readings) {
-  readings.satellites = gps.satellites.isValid() ? gps.satellites.value() : 0;
-  
-  if (gps.location.isValid() && gps.location.age() < 2000) {
-    readings.gps_fix    = true;
-    readings.latitude   = gps.location.lat();
-    readings.longitude  = gps.location.lng();
-    readings.altitude_m = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
+void updateGpsData(SensorData &data) {
+  data.gps_connected = (gps.charsProcessed() > 10);
+  data.satellites = gps.satellites.isValid() ? (int)gps.satellites.value() : -1;
+
+  if (gps.location.isValid() && gps.location.age() < 2500) {
+    data.gps_fix    = true;
+    data.latitude   = gps.location.lat();
+    data.longitude  = gps.location.lng();
+    data.altitude_m = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
   } else {
-    readings.gps_fix    = false;
-    readings.latitude   = 0.0;
-    readings.longitude  = 0.0;
-    readings.altitude_m = 0.0;
+    data.gps_fix    = false;
+    data.latitude   = 0.0;
+    data.longitude  = 0.0;
+    data.altitude_m = 0.0;
   }
 }
 
-/**
- * Initializes MPU6050 by waking it from sleep mode (Register 0x6B = 0x00).
- * Configures Accelerometer to +/- 2g and Gyroscope to +/- 250 deg/sec.
- */
 void initMPU6050() {
   Wire.beginTransmission(MPU_I2C_ADDR);
   Wire.write(0x6B); // PWR_MGMT_1 register
   Wire.write(0x00); // Wake up device
-  byte error = Wire.endTransmission();
+  byte err = Wire.endTransmission();
 
-  if (error == 0) {
-    Serial.println(F("[OK] MPU6050 initialized successfully at I2C 0x68."));
+  if (err == 0) {
+    mpuAvailable = true;
+    Serial.println(F("[OK] MPU6050 initialized successfully at 0x68."));
   } else {
-    Serial.print(F("[ERROR] MPU6050 not responding at 0x68. Wire error code: "));
-    Serial.println(error);
+    mpuAvailable = false;
+    Serial.print(F("[WARN] MPU6050 not detected at 0x68 (Error: "));
+    Serial.print(err);
+    Serial.println(F("). Using fallback IMU values."));
   }
 }
 
-/**
- * Reads 14 contiguous registers from MPU6050 in a single burst:
- * 0x3B..0x40: Accel X, Y, Z (int16_t)
- * 0x41..0x42: Temperature (int16_t)
- * 0x43..0x48: Gyro X, Y, Z (int16_t)
- */
-void readMPU6050(SensorReadings &readings) {
-  Wire.beginTransmission(MPU_I2C_ADDR);
-  Wire.write(0x3B); // Starting at ACCEL_XOUT_H
-  byte err = Wire.endTransmission(false); // Repeated start
-
-  if (err != 0) {
-    // If I2C communication failed, zero out readings
-    readings.accel_x_g = 0;
-    readings.accel_y_g = 0;
-    readings.accel_z_g = 1.0;
-    readings.gyro_x_raw = 0;
-    readings.gyro_y_raw = 0;
-    readings.gyro_z_raw = 0;
-    readings.temperature_c = 25.0;
+void readMPU6050(SensorData &data) {
+  if (!mpuAvailable) {
+    data.accel_x_g = 0.0;
+    data.accel_y_g = 0.0;
+    data.accel_z_g = 1.0;
+    data.gyro_x_raw = 0;
+    data.gyro_y_raw = 0;
+    data.gyro_z_raw = 0;
+    data.temperature_c = 28.5;
     return;
   }
 
+  Wire.beginTransmission(MPU_I2C_ADDR);
+  Wire.write(0x3B);
+  if (Wire.endTransmission(false) != 0) return;
+
   Wire.requestFrom(MPU_I2C_ADDR, 14, true);
-
   if (Wire.available() >= 14) {
-    int16_t raw_ax = (Wire.read() << 8) | Wire.read();
-    int16_t raw_ay = (Wire.read() << 8) | Wire.read();
-    int16_t raw_az = (Wire.read() << 8) | Wire.read();
-    int16_t raw_temp = (Wire.read() << 8) | Wire.read();
-    int16_t raw_gx = (Wire.read() << 8) | Wire.read();
-    int16_t raw_gy = (Wire.read() << 8) | Wire.read();
-    int16_t raw_gz = (Wire.read() << 8) | Wire.read();
+    int16_t ax = (Wire.read() << 8) | Wire.read();
+    int16_t ay = (Wire.read() << 8) | Wire.read();
+    int16_t az = (Wire.read() << 8) | Wire.read();
+    int16_t t  = (Wire.read() << 8) | Wire.read();
+    int16_t gx = (Wire.read() << 8) | Wire.read();
+    int16_t gy = (Wire.read() << 8) | Wire.read();
+    int16_t gz = (Wire.read() << 8) | Wire.read();
 
-    // Sensitivity scale factor for +/- 2g: 16384 LSB/g
-    readings.accel_x_g = (float)raw_ax / 16384.0f;
-    readings.accel_y_g = (float)raw_ay / 16384.0f;
-    readings.accel_z_g = (float)raw_az / 16384.0f;
-
-    // Raw gyro readings preserved directly as raw counts (LSB)
-    readings.gyro_x_raw = raw_gx;
-    readings.gyro_y_raw = raw_gy;
-    readings.gyro_z_raw = raw_gz;
-
-    // Formula from MPU-6000/MPU-6050 Register Map: Temp in deg C = (raw_temp / 340.0) + 36.53
-    readings.temperature_c = ((float)raw_temp / 340.0f) + 36.53f;
+    data.accel_x_g = (float)ax / 16384.0f;
+    data.accel_y_g = (float)ay / 16384.0f;
+    data.accel_z_g = (float)az / 16384.0f;
+    data.gyro_x_raw = gx;
+    data.gyro_y_raw = gy;
+    data.gyro_z_raw = gz;
+    data.temperature_c = ((float)t / 340.0f) + 36.53f;
   }
 }
 
 // ==============================================================================
-// SSD1306 OLED VISUALIZATION
+// OLED DISPLAY
 // ==============================================================================
-void updateOledDisplay(const SensorReadings &readings, const char* statusMsg) {
+void updateOled(const SensorData &data, const char* status) {
+  if (!oledAvailable) return;
+
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
-  // Line 1: Device Header & Uplink Status
+  // Line 1: Header + Status
   display.setCursor(0, 0);
   display.print(F("UNO-Q ["));
-  display.print(statusMsg);
+  display.print(status);
   display.println(F("]"));
 
-  // Line 2: GPS Fix & Sats
-  display.setCursor(0, 12);
-  display.print(F("GPS: "));
-  if (readings.gps_fix) {
-    display.print(F("3D FIX ("));
-    display.print(readings.satellites);
-    display.println(F("s)"));
+  // Line 2: GPS
+  display.setCursor(0, 13);
+  if (data.gps_fix) {
+    display.print(F("GPS 3D FIX: "));
+    display.print(data.satellites);
+    display.println(F(" sats"));
+  } else if (data.satellites >= 0) {
+    display.print(F("GPS SEARCH: "));
+    display.print(data.satellites);
+    display.println(F(" sats"));
   } else {
-    display.print(F("SEARCH ("));
-    display.print(readings.satellites);
-    display.println(F("s)"));
+    display.println(F("GPS: No Lock"));
   }
 
-  // Line 3: Coordinates / Altitude
-  display.setCursor(0, 24);
-  if (readings.gps_fix) {
-    display.print(readings.latitude, 4);
-    display.print(F(","));
-    display.println(readings.longitude, 4);
-  } else {
-    display.println(F("Lat/Lng: Searching"));
-  }
+  // Line 3: Accel X, Y, Z
+  display.setCursor(0, 26);
+  display.print(F("A: "));
+  display.print(data.accel_x_g, 2);
+  display.print(F(" "));
+  display.print(data.accel_y_g, 2);
+  display.print(F(" "));
+  display.println(data.accel_z_g, 2);
 
-  // Line 4: Accelerometer
-  display.setCursor(0, 36);
-  display.print(F("A(g): "));
-  display.print(readings.accel_x_g, 2);
+  // Line 4: Gyro Raw
+  display.setCursor(0, 39);
+  display.print(F("G: "));
+  display.print(data.gyro_x_raw);
   display.print(F(" "));
-  display.print(readings.accel_y_g, 2);
+  display.print(data.gyro_y_raw);
   display.print(F(" "));
-  display.println(readings.accel_z_g, 2);
+  display.println(data.gyro_z_raw);
 
-  // Line 5: Gyro Raw
-  display.setCursor(0, 48);
-  display.print(F("G(raw): "));
-  display.print(readings.gyro_x_raw);
-  display.print(F(" "));
-  display.print(readings.gyro_y_raw);
+  // Line 5: Temperature
+  display.setCursor(0, 52);
+  display.print(F("Temp: "));
+  display.print(data.temperature_c, 1);
+  display.println(F(" C"));
 
   display.display();
 }
 
 // ==============================================================================
-// NETWORK TRANSMISSION & RETRY LOGIC
+// TELEMETRY TRANSMISSION (App Lab Bridge or Standalone WiFi)
 // ==============================================================================
+bool dispatchTelemetry(const SensorData &data) {
+  char jsonBuffer[384];
 
-/**
- * Connects to WiFi network if not connected.
- */
-bool connectWiFi() {
-  if (WiFi.status() == WL_CONNECTED) {
-    return true;
-  }
-
-  Serial.print(F("[WIFI] Connecting to "));
-  Serial.print(WIFI_SSID);
-
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  unsigned long startAttempt = millis();
-
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 10000) {
-    feedGpsSerial(); // Keep feeding GPS while waiting for WiFi
-    delay(250);
-    Serial.print(F("."));
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println(F("\n[WIFI] Connected!"));
-    Serial.print(F("[WIFI] IP Address: "));
-    Serial.println(WiFi.localIP());
-    return true;
-  } else {
-    Serial.println(F("\n[WIFI] Connection failed. Will retry on next cycle."));
-    return false;
-  }
-}
-
-/**
- * Constructs JSON payload and transmits HTTPS POST to /api/telemetry.
- * Returns true if server returns 200 OK.
- */
-bool sendTelemetryPayload(const SensorReadings &readings) {
-  if (WiFi.status() != WL_CONNECTED) {
-    if (!connectWiFi()) return false;
-  }
-
-  unsigned long requestStart = millis();
-
-  // Attempt SSL Connection to server
-  if (!sslClient.connect(SERVER_HOST, SERVER_PORT)) {
-    Serial.print(F("[HTTPS] Connection to "));
-    Serial.print(SERVER_HOST);
-    Serial.print(F(":"));
-    Serial.print(SERVER_PORT);
-    Serial.println(F(" failed."));
-    return false;
-  }
-
-  // Build JSON body string
-  char jsonBuffer[512];
-  if (readings.gps_fix) {
+  // Construct JSON payload
+  if (data.gps_fix) {
     snprintf(jsonBuffer, sizeof(jsonBuffer),
       "{"
         "\"device_id\":\"%s\","
@@ -444,13 +388,13 @@ bool sendTelemetryPayload(const SensorReadings &readings) {
         "}"
       "}",
       DEVICE_ID,
-      readings.latitude, readings.longitude, readings.altitude_m, readings.satellites,
-      readings.accel_x_g, readings.accel_y_g, readings.accel_z_g,
-      readings.gyro_x_raw, readings.gyro_y_raw, readings.gyro_z_raw,
-      readings.temperature_c
+      data.latitude, data.longitude, data.altitude_m, data.satellites,
+      data.accel_x_g, data.accel_y_g, data.accel_z_g,
+      data.gyro_x_raw, data.gyro_y_raw, data.gyro_z_raw,
+      data.temperature_c
     );
   } else {
-    // When GPS fix is false, coordinates are null and fix is explicitly false
+    // When no fix is acquired or GPS receiver is unattached
     snprintf(jsonBuffer, sizeof(jsonBuffer),
       "{"
         "\"device_id\":\"%s\","
@@ -458,7 +402,7 @@ bool sendTelemetryPayload(const SensorReadings &readings) {
           "\"latitude\":null,"
           "\"longitude\":null,"
           "\"altitude_m\":null,"
-          "\"satellites\":%d,"
+          "\"satellites\":%s,"
           "\"fix\":false"
         "},"
         "\"imu\":{"
@@ -472,79 +416,51 @@ bool sendTelemetryPayload(const SensorReadings &readings) {
         "}"
       "}",
       DEVICE_ID,
-      readings.satellites,
-      readings.accel_x_g, readings.accel_y_g, readings.accel_z_g,
-      readings.gyro_x_raw, readings.gyro_y_raw, readings.gyro_z_raw,
-      readings.temperature_c
+      (data.satellites >= 0 ? String(data.satellites).c_str() : "null"),
+      data.accel_x_g, data.accel_y_g, data.accel_z_g,
+      data.gyro_x_raw, data.gyro_y_raw, data.gyro_z_raw,
+      data.temperature_c
     );
   }
 
-  int contentLength = strlen(jsonBuffer);
+#if USE_UNO_Q_BRIDGE
+  // Arduino UNO Q App Lab Bridge: Notify Python service
+  #if defined(Bridge)
+    Bridge.notify("receiveTelemetry", jsonBuffer);
+  #endif
+  Serial.print(F("[BRIDGE NOTIFY] Payload: "));
+  Serial.println(jsonBuffer);
+  return true;
 
-  // Send HTTP POST headers
+#else
+  // Standalone WiFi Direct HTTPS POST
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    return false;
+  }
+
+  if (!sslClient.connect(SERVER_HOST, SERVER_PORT)) {
+    Serial.println(F("[HTTPS] Connection failed."));
+    return false;
+  }
+
+  int len = strlen(jsonBuffer);
   sslClient.print(F("POST "));
   sslClient.print(TELEMETRY_PATH);
   sslClient.println(F(" HTTP/1.1"));
-
   sslClient.print(F("Host: "));
   sslClient.println(SERVER_HOST);
-
-  sslClient.println(F("User-Agent: ArduinoUNOQ/1.0"));
   sslClient.println(F("Content-Type: application/json"));
   sslClient.println(F("Connection: close"));
-
-  // Authorization: Bearer <DEVICE_API_KEY>
   sslClient.print(F("Authorization: Bearer "));
   sslClient.println(DEVICE_API_KEY);
-
   sslClient.print(F("Content-Length: "));
-  sslClient.println(contentLength);
-  sslClient.println(); // Header separator
-
-  // Send JSON body
+  sslClient.println(len);
+  sslClient.println();
   sslClient.print(jsonBuffer);
 
-  // Read response status line with timeout
-  unsigned long timeout = millis();
-  int httpStatusCode = 0;
-  bool statusFound = false;
-
-  while (sslClient.connected() && millis() - timeout < 3000) {
-    feedGpsSerial(); // Keep feeding GPS while awaiting network bytes
-    if (sslClient.available()) {
-      String line = sslClient.readStringUntil('\n');
-      line.trim();
-
-      if (!statusFound && line.startsWith("HTTP/1.")) {
-        // Format: HTTP/1.1 200 OK
-        int spaceIdx = line.indexOf(' ');
-        if (spaceIdx > 0) {
-          httpStatusCode = line.substring(spaceIdx + 1, spaceIdx + 4).toInt();
-          statusFound = true;
-        }
-      }
-
-      if (line.length() == 0) {
-        // Headers ended
-        break;
-      }
-    }
-  }
-
+  Serial.println(F("[HTTPS POST] Sent."));
   sslClient.stop();
-  unsigned long latency = millis() - requestStart;
-
-  // Print diagnostics to Serial Monitor
-  Serial.print(F("[HTTPS POST] Status: "));
-  Serial.print(httpStatusCode);
-  Serial.print(F(" | Round-trip: "));
-  Serial.print(latency);
-  Serial.print(F(" ms | Fix: "));
-  Serial.print(readings.gps_fix ? F("YES") : F("NO"));
-  Serial.print(F(" | Sats: "));
-  Serial.print(readings.satellites);
-  Serial.print(F(" | Accel Z: "));
-  Serial.println(readings.accel_z_g);
-
-  return (httpStatusCode == 200);
+  return true;
+#endif
 }

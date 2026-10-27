@@ -10,9 +10,10 @@ Built with **Next.js (App Router, TypeScript)**, **Tailwind CSS**, **Recharts**,
 
 ```mermaid
 flowchart LR
-    subgraph Edge ["Hardware Node (Edge)"]
-        Sensors["NEO-6M GPS & MPU6050 IMU"] --> MCU["Arduino UNO Q + SSD1306 OLED"]
-        MCU -->|"HTTPS POST (1 Hz)<br/>Bearer Token Auth"| Endpoint["POST /api/telemetry"]
+    subgraph Edge ["Hardware Node (Arduino UNO Q)"]
+        Sensors["NEO-6M GPS & MPU6050 IMU"] --> MCU["MCU Core (C++ Sketch) + OLED"]
+        MCU -->|"Bridge.notify('receiveTelemetry')"| Linux["Linux MPU (uno_q_bridge.py)"]
+        Linux -->|"HTTPS POST (1 Hz)<br/>Bearer Token Auth"| Endpoint["POST /api/telemetry"]
     end
 
     subgraph Server ["Server Execution (In-Memory Only)"]
@@ -163,7 +164,7 @@ cp .env.example .env.local
 ```
 Configure your secret device key:
 ```env
-DEVICE_API_KEY=arduino-uno-q-secret-key-2026
+DEVICE_API_KEY=UNOQ-IoT-2026-Devansh-9f7c2a8e4b6d
 ```
 
 ### 3. Run Development Server
@@ -188,45 +189,37 @@ Toggle the **Demo Mode** switch in the top navigation bar. The simulator generat
 - MPU6050 1g gravity vector, tilt dynamics, and raw gyroscope noise.
 - Toggle between **3D GPS Fix** and **No Fix / Searching** mode to verify error handling.
 
-### B. Automated Integration Test Suite
-With the server running on port 3000, run:
+### B. Python App Lab Bridge Test
+Run the bridge script locally or on the Arduino UNO Q Linux terminal:
 ```bash
-node -e '
-async function test() {
-  const base = "http://localhost:3000";
-  // Test Unauthorized
-  const resAuth = await fetch(`${base}/api/telemetry`, { method: "POST" });
-  console.log("Auth Check:", resAuth.status === 401 ? "PASS (401)" : "FAIL");
-
-  // Test Valid Ingestion
-  const resPost = await fetch(`${base}/api/telemetry`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": "Bearer arduino-uno-q-secret-key-2026"
-    },
-    body: JSON.stringify({
-      device_id: "uno-q-test",
-      gps: { latitude: 17.385, longitude: 78.4867, altitude_m: 540, satellites: 8, fix: true },
-      imu: { accel_x_g: 0.01, accel_y_g: -0.02, accel_z_g: 1.0, gyro_x_raw: 120, gyro_y_raw: -45, gyro_z_raw: 60, temperature_c: 29.5 }
-    })
-  });
-  console.log("POST Check:", resPost.status === 200 ? "PASS (200 OK)" : "FAIL");
-}
-test();'
+python3 uno_q_bridge.py
 ```
 
 ### C. Manual cURL Ingestion Test
 ```bash
-curl -X POST http://localhost:3000/api/telemetry \
+curl -X POST https://arduino-uno-q-iot-dashboard.vercel.app/api/telemetry \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer arduino-uno-q-secret-key-2026" \
+  -H "Authorization: Bearer UNOQ-IoT-2026-Devansh-9f7c2a8e4b6d" \
   -d '{
-    "device_id": "uno-q-01",
+    "device_id": "arduino-uno-q",
     "timestamp": "2026-10-27T15:00:00.000Z",
     "gps": {
       "latitude": 17.385,
       "longitude": 78.4867,
+      "altitude_m": 542.0,
+      "satellites": 8,
+      "fix": true
+    },
+    "imu": {
+      "accel_x_g": 0.012,
+      "accel_y_g": -0.024,
+      "accel_z_g": 0.998,
+      "gyro_x_raw": 120,
+      "gyro_y_raw": -45,
+      "gyro_z_raw": 60,
+      "temperature_c": 29.5
+    }
+  }'
       "altitude_m": 542.0,
       "satellites": 8,
       "fix": true
